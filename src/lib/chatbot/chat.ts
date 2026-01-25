@@ -1,238 +1,199 @@
-import { openai, logger, updateSpan } from '../braintrust'
+import { openai } from '../braintrust'
 import { chatbotTools, ToolName } from './tools'
 import { executeTool } from './tool-executor'
 import { systemPrompt } from './system-prompt'
 import {
   ChatCompletionMessageParam,
-  ChatCompletionMessageToolCall,
+  ChatCompletionMessageFunctionToolCall,
 } from 'openai/resources/chat/completions'
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
-  tool_calls?: ChatCompletionMessageToolCall[]
+  tool_calls?: ChatCompletionMessageFunctionToolCall[]
   tool_call_id?: string
 }
 
 export interface ChatOptions {
-  sessionId?: string
-  parentSpanId?: string
-  /** Skip conversation span management (for evals where the framework handles tracing) */
-  skipSpanManagement?: boolean
-  /** Custom instructions/system prompt (defaults to systemPrompt) */
   instructions?: string
-}
-
-export interface ToolCallInfo {
-  id: string
-  name: string
-  arguments: string
-  result?: unknown
 }
 
 export interface ChatResult {
   content: string
-  toolCalls: ToolCallInfo[]
-  conversationSpanId?: string
   messages: ChatCompletionMessageParam[]
 }
 
 /**
- * Core chat logic without span management.
+ * Normalize various input formats into a clean ChatMessage array.
+ * Handles: arrays, strings, { messages: [] }, { input: "" }, { '0': msg, '1': msg }
+ * Validates tool message ordering (removes orphaned tool messages).
+ */
+export function normalizeMessages(input: unknown): ChatMessage[] {
+  if (input === undefined || input === null) {
+    throw new Error('Input cannot be undefined or null')
+  }
+
+  // Determine raw messages from various input formats
+  let rawMessages: unknown[]
+
+  if (Array.isArray(input)) {
+    rawMessages = input
+  } else if (typeof input === 'string') {
+    return [{ role: 'user', content: input }]
+  } else if (typeof input === 'object') {
+    const obj = input as Record<string, unknown>
+    if (obj.messages && Array.isArray(obj.messages)) {
+      rawMessages = obj.messages
+    } else if (obj['0'] !== undefined) {
+      // Handle { '0': msg, '1': msg } format
+      rawMessages = Object.values(obj)
+    } else if (obj.input) {
+      return Array.isArray(obj.input)
+        ? normalizeMessages(obj.input)
+        : [{ role: 'user', content: String(obj.input) }]
+    } else if (obj.content) {
+      return [{ role: (obj.role as 'user' | 'assistant') || 'user', content: String(obj.content) }]
+    } else {
+      return [{ role: 'user', content: JSON.stringify(input) }]
+    }
+  } else {
+    return [{ role: 'user', content: JSON.stringify(input) }]
+  }
+
+  // Transform and validate tool message ordering
+  const messages: ChatMessage[] = []
+  let pendingToolCallIds = new Set<string>()
+
+  for (const m of rawMessages) {
+    const msg = m as Record<string, unknown>
+    const role = msg.role as string
+
+    if (role === 'tool') {
+      // Skip orphaned tool messages
+      if (!pendingToolCallIds.has(msg.tool_call_id as string)) {
+        continue
+      }
+      pendingToolCallIds.delete(msg.tool_call_id as string)
+      messages.push({
+        role: 'tool',
+        content: String(msg.content),
+        tool_call_id: msg.tool_call_id as string,
+      })
+    } else if (role === 'assistant') {
+      const toolCalls = msg.tool_calls as ChatCompletionMessageFunctionToolCall[] | undefined
+      if (toolCalls?.length) {
+        // Clear any pending tool calls from previous assistant message
+        if (pendingToolCallIds.size > 0 && messages.length > 0) {
+          const lastMsg = messages[messages.length - 1]
+          if (lastMsg.role === 'assistant' && lastMsg.tool_calls) {
+            messages.pop()
+          }
+        }
+        pendingToolCallIds = new Set(toolCalls.map((tc) => tc.id))
+        messages.push({
+          role: 'assistant',
+          content: String(msg.content || ''),
+          tool_calls: toolCalls,
+        })
+      } else {
+        // Regular assistant message - clear pending state
+        if (pendingToolCallIds.size > 0 && messages.length > 0) {
+          const lastMsg = messages[messages.length - 1]
+          if (lastMsg.role === 'assistant' && lastMsg.tool_calls) {
+            messages.pop()
+          }
+        }
+        pendingToolCallIds = new Set()
+        messages.push({ role: 'assistant', content: String(msg.content) })
+      }
+    } else {
+      // User or system message - clear pending state
+      if (pendingToolCallIds.size > 0 && messages.length > 0) {
+        const lastMsg = messages[messages.length - 1]
+        if (lastMsg.role === 'assistant' && lastMsg.tool_calls) {
+          messages.pop()
+        }
+      }
+      pendingToolCallIds = new Set()
+      messages.push({ role: role as 'user' | 'system', content: String(msg.content) })
+    }
+  }
+
+  // Remove trailing assistant message with unanswered tool_calls
+  if (messages.length > 0 && pendingToolCallIds.size > 0) {
+    const lastMsg = messages[messages.length - 1]
+    if (lastMsg.role === 'assistant' && lastMsg.tool_calls) {
+      messages.pop()
+    }
+  }
+
+  return messages
+}
+
+/**
+ * Pure chat function - no span management.
  * LLM calls are auto-traced via wrapOpenAI.
  * Tool calls are auto-traced via wrapTracedTool.
+ * Callers are responsible for span management if needed.
  */
-async function chatCore(messages: ChatMessage[], instructions?: string): Promise<ChatResult> {
-  // Build conversation with system prompt (use custom instructions if provided)
+export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
   const conversationMessages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: instructions || systemPrompt },
+    { role: 'system', content: options.instructions || systemPrompt },
     ...messages.map((m) => {
       if (m.role === 'tool') {
-        return {
-          role: 'tool' as const,
-          content: m.content,
-          tool_call_id: m.tool_call_id!,
-        }
+        return { role: 'tool' as const, content: m.content, tool_call_id: m.tool_call_id! }
       }
       if (m.tool_calls) {
-        return {
-          role: 'assistant' as const,
-          content: m.content || null,
-          tool_calls: m.tool_calls,
-        }
+        return { role: 'assistant' as const, content: m.content || null, tool_calls: m.tool_calls }
       }
-      return {
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-      }
+      return { role: m.role as 'user' | 'assistant', content: m.content }
     }),
   ]
 
-  const currentMessages = [...conversationMessages]
   let assistantContent = ''
-  const allToolCalls: ToolCallInfo[] = []
   let continueLoop = true
 
   while (continueLoop) {
-    // LLM call - auto-traced via wrapOpenAI
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
-      messages: currentMessages,
+      messages: conversationMessages,
       tools: chatbotTools,
       tool_choice: 'auto',
     })
 
     const message = response.choices[0]?.message
     assistantContent = message?.content || ''
-    const toolCalls = message?.tool_calls || []
+    // Filter to only function tool calls (type: 'function')
+    const toolCalls = (message?.tool_calls || []).filter(
+      (tc): tc is ChatCompletionMessageFunctionToolCall => tc.type === 'function'
+    )
 
     if (toolCalls.length > 0) {
-      // Add assistant message with tool calls
-      currentMessages.push({
+      conversationMessages.push({
         role: 'assistant',
         content: assistantContent || null,
         tool_calls: toolCalls,
       })
 
-      // Execute each tool call - auto-traced via wrapTracedTool
-      for (const toolCall of toolCalls) {
-        const toolName = toolCall.function.name as ToolName
-        let parameters: Record<string, unknown> = {}
-
-        try {
-          parameters = JSON.parse(toolCall.function.arguments || '{}')
-        } catch {
-          parameters = {}
-        }
-
-        const { result, error } = await executeTool(toolName, parameters)
-        const toolResult = error ? { error } : result
-
-        allToolCalls.push({
-          id: toolCall.id,
-          name: toolName,
-          arguments: toolCall.function.arguments,
-          result: toolResult,
-        })
-
-        currentMessages.push({
+      for (const tc of toolCalls) {
+        const { result, error } = await executeTool(
+          tc.function.name as ToolName,
+          JSON.parse(tc.function.arguments || '{}')
+        )
+        conversationMessages.push({
           role: 'tool',
-          content: JSON.stringify(toolResult),
-          tool_call_id: toolCall.id,
+          content: JSON.stringify(error ? { error } : result),
+          tool_call_id: tc.id,
         })
       }
     } else {
       continueLoop = false
-
-      currentMessages.push({
-        role: 'assistant',
-        content: assistantContent,
-      })
+      conversationMessages.push({ role: 'assistant', content: assistantContent })
     }
   }
 
-  // Build complete conversation history (excluding system prompt)
-  const fullConversationHistory = currentMessages.slice(1)
-
   return {
     content: assistantContent,
-    toolCalls: allToolCalls,
-    messages: fullConversationHistory,
+    messages: conversationMessages.slice(1), // Exclude system prompt
   }
-}
-
-/**
- * Chat function with full conversation span management.
- * Used by the API route for distributed tracing across turns.
- * For evals, use skipSpanManagement: true to let the eval framework handle tracing.
- */
-export async function chat(
-  messages: ChatMessage[],
-  options: ChatOptions = {}
-): Promise<ChatResult> {
-  const { sessionId, parentSpanId, skipSpanManagement } = options
-
-  // For evals or when span management is skipped, just run the core chat logic
-  if (skipSpanManagement) {
-    return chatCore(messages, options.instructions)
-  }
-
-  const turnNumber = messages.filter((m) => m.role === 'user').length
-  const isFirstTurn = !parentSpanId
-
-  // Distributed tracing for multi-turn conversations
-  let conversationSpanId: string
-  let conversationSpan: ReturnType<typeof logger.startSpan> | null = null
-
-  if (isFirstTurn) {
-    conversationSpan = logger.startSpan({ name: 'conversation' })
-    conversationSpan.log({
-      metadata: {
-        sessionId,
-        type: 'multi_turn_conversation',
-      },
-    })
-    conversationSpanId = await conversationSpan.export()
-  } else {
-    conversationSpanId = parentSpanId
-  }
-
-  // Create the turn span as a child of the conversation
-  const turnSpanOptions = {
-    name: `chat_turn_${turnNumber}`,
-    parent: conversationSpanId,
-  }
-
-  return await logger.traced(
-    async (span) => {
-      span.log({
-        input: messages[messages.length - 1]?.content,
-        metadata: {
-          sessionId,
-          turnNumber,
-        },
-      })
-
-      // Run the core chat logic
-      const result = await chatCore(messages, options.instructions)
-
-      // Log the final output to the turn span
-      span.log({
-        output: result.content,
-        metadata: {
-          toolCallsCount: result.toolCalls.length,
-          turnNumber,
-        },
-      })
-
-      // Update conversation span with full history including tool calls
-      if (isFirstTurn && conversationSpan) {
-        conversationSpan.log({
-          input: result.messages,
-          output: result.content,
-          metadata: {
-            turnNumber,
-            messagesCount: result.messages.length,
-          },
-        })
-        conversationSpan.end()
-      } else {
-        updateSpan({
-          exported: conversationSpanId,
-          input: result.messages,
-          output: result.content,
-          metadata: {
-            turnNumber,
-            messagesCount: result.messages.length,
-          },
-        })
-      }
-
-      return {
-        ...result,
-        conversationSpanId,
-      }
-    },
-    turnSpanOptions
-  )
 }

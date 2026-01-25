@@ -12,7 +12,7 @@ const openaiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 })
 
-export const openai = wrapOpenAI(openaiClient, { logger })
+export const openai = wrapOpenAI(openaiClient)
 
 // Helper to create traced functions with custom type
 export function wrapTracedTool<Args extends unknown[], Return>(
