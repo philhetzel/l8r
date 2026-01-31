@@ -146,6 +146,20 @@ Both evals support a `instructions` parameter to test different system prompts v
 npx braintrust eval evals/sim.eval.ts --dev'
 ```
 
+### Hosting the remote eval dev server (Modal)
+
+This repo includes `deploy/modal_eval_server.py`, which starts Braintrust's eval dev server for the TypeScript evals and exposes it as an HTTPS endpoint on Modal.
+
+**Prereqs:**
+- Install Modal locally (`pip install modal`) and authenticate (`modal setup`)
+- Ensure your `.env` contains `BRAINTRUST_API_KEY` `OPENAI_API_KEY`
+
+**Deploy:**
+
+```bash
+modal deploy deploy/modal_eval_server.py
+```
+
 ## Database Commands
 
 | Command | Description |
