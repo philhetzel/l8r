@@ -43,3 +43,6 @@ prisma/dev.db
 next-env.d.ts
 
 .env
+
+# python stuff
+__pycache__/
