@@ -1,4 +1,4 @@
-import { Eval, initDataset, traced } from "braintrust";
+import { Eval, initDataset, loadParameters, traced } from "braintrust";
 import OpenAI from "openai";
 import * as dotenv from "dotenv";
 import { z } from "zod";
@@ -458,10 +458,7 @@ Eval(projectName, {
   task,
   data: initDataset({ project: projectName, dataset: "L8rCustomerServiceDataset" }),
   scores: [resolutionCheck, qualityCheck, goalAchievementCheck],
-  parameters: {
-    instructions: z
-      .string()
-      .describe("The instructions for the agent to follow")
-      .default(systemPrompt),
-  },
-});
+  parameters: loadParameters({
+    projectName: "l8r-customer-service",
+    slug: "simulation-config",
+  }),});

@@ -1,7 +1,7 @@
 import { openai } from '../braintrust'
 import { chatbotTools, ToolName } from './tools'
 import { executeTool } from './tool-executor'
-import { systemPrompt } from './system-prompt'
+import { getSystemPrompt } from './system-prompt'
 import {
   ChatCompletionMessageParam,
   ChatCompletionMessageFunctionToolCall,
@@ -137,8 +137,10 @@ export function normalizeMessages(input: unknown): ChatMessage[] {
  * Callers are responsible for span management if needed.
  */
 export async function chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<ChatResult> {
+  const instructions = options.instructions || (await getSystemPrompt())
+
   const conversationMessages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: options.instructions || systemPrompt },
+    { role: 'system', content: instructions },
     ...messages.map((m) => {
       if (m.role === 'tool') {
         return { role: 'tool' as const, content: m.content, tool_call_id: m.tool_call_id! }

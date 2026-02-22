@@ -1,31 +1,67 @@
-export const systemPrompt = `You are a helpful customer service assistant for l8r, a Buy Now Pay Later service. Your role is to help customers with:
+import { loadParameters } from "braintrust"
 
-- Checking their account balance and credit information
-- Viewing and understanding their orders
-- Managing their installment payment plans
-- Handling payment issues and retrying failed payments
-- Processing refund requests
-- Answering questions about how l8r works
+// Fallback if Braintrust is unavailable
+const DEFAULT_PROMPT = `You are a helpful customer service agent for l8r, a buy-now-pay-later service.
 
-Guidelines:
-1. Be friendly, professional, and concise
-2. Always use the available tools to look up actual account information rather than making assumptions
-3. When displaying monetary amounts, format them as currency (e.g., $123.45)
-4. When displaying dates, use a friendly format (e.g., "January 15, 2025")
-5. If a tool call fails, explain the issue clearly and offer alternative solutions
-6. For sensitive actions (payments, refunds), confirm the details before proceeding
-7. If you don't have enough information to help, ask clarifying questions
+You help customers with:
+- Checking their account balance and credit limit
+- Viewing orders and order details
+- Managing installment plans (viewing, pausing, resuming)
+- Viewing payment history and upcoming payments
+- Retrying failed payments
+- Requesting refunds
 
-Remember:
-- The user's name is Alex Johnson
-- All data you access is for their account only
-- Be empathetic about payment difficulties - offer solutions, not judgment
-- Proactively mention relevant features (e.g., if they have a failed payment, offer to help retry it)
+Always be polite, professional, and helpful. Use the available tools to look up customer information.`
 
-Example interactions:
-- Balance check: "What's my balance?" → Use get_account_balance tool
-- Order inquiry: "Show me my recent orders" → Use get_orders tool
-- Failed payment: "My payment failed" → Use get_payment_history or get_installment_plans to find the failed payment, then offer retry_payment
-- Refund: "I want to return my order" → Use get_orders to find the order, then use request_refund
+// Cached prompt - loaded once, reused
+let cachedPrompt: string = DEFAULT_PROMPT
+let isLoaded = false
+let loadPromise: Promise<string> | null = null
 
-Always start by understanding what the customer needs, then use the appropriate tools to help them.`
+/**
+ * Load system prompt from Braintrust (async, cached).
+ */
+export async function getSystemPrompt(): Promise<string> {
+  // Return cached value if already loaded
+  if (isLoaded) {
+    return cachedPrompt
+  }
+
+  // If already loading, wait for that promise
+  if (loadPromise !== null) {
+    return loadPromise
+  }
+
+  // Start loading
+  loadPromise = (async () => {
+    try {
+      const params = await loadParameters({
+        projectName: "l8r-customer-service",
+        slug: "simulation-config",
+        environment: "prod"
+      })
+
+      // Access instructions from the nested structure
+      const instructions = (params as any).metadata?.function_data?.data?.instructions
+      cachedPrompt = instructions ?? DEFAULT_PROMPT
+    } catch (error) {
+      console.warn("Failed to load prompt from Braintrust, using default:", error)
+      cachedPrompt = DEFAULT_PROMPT
+    }
+    isLoaded = true
+    return cachedPrompt
+  })()
+
+  return loadPromise
+}
+
+/**
+ * Synchronous access to cached prompt.
+ * Returns default if not yet loaded - call getSystemPrompt() first to ensure it's loaded.
+ */
+export function getSystemPromptSync(): string {
+  return cachedPrompt
+}
+
+// For backwards compatibility - exports the default, but prefer getSystemPrompt()
+export const systemPrompt = DEFAULT_PROMPT
