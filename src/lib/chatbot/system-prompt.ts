@@ -41,8 +41,9 @@ export async function getSystemPrompt(): Promise<string> {
         environment: "prod"
       })
 
-      // Access instructions from the nested structure
-      const instructions = (params as any).metadata?.function_data?.data?.instructions
+      // Access instructions from the parameters data
+      const data = params.data as Record<string, unknown>
+      const instructions = typeof data.instructions === "string" ? data.instructions : undefined
       cachedPrompt = instructions ?? DEFAULT_PROMPT
     } catch (error) {
       console.warn("Failed to load prompt from Braintrust, using default:", error)
